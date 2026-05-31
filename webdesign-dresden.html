@@ -1807,11 +1807,16 @@ ul { list-style: none; }
        die (gezielteren, ausführlicheren) Fragen. Wird sowohl vom
        schwebenden Widget als auch vom Buchungs-Modal genutzt.
        ========================================================= */
-    var LUMI_ENDPOINT = '/api/lumi';        // serverseitiger Proxy (siehe api/lumi.js)
-    var LUMI_SUBMIT_ENDPOINT = '/api/briefing';
+    var LUMI_ENDPOINT = '/api/lumi-chat';   // serverseitiger Gemini-Proxy (api/lumi-chat.js)
     var LUMI_MAX_TURNS = 25;                // Missbrauchs-/Kostenschutz (B1)
 
-    // Erste Nachricht (clientseitig fix – Anthropic verlangt User-Start)
+    // Eindeutiges, anonymes Session-Token (für Rate-Limiting in chat_sessions)
+    function lumiNewToken() {
+        try { if (window.crypto && window.crypto.randomUUID) { return 'lumi-' + window.crypto.randomUUID(); } } catch (e) {}
+        return 'lumi-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+    }
+
+    // Erste Nachricht (clientseitig fix – spart einen API-Aufruf)
     var LUMI_GREETING = 'Hallo, ich bin Lumi 👋 Ich stelle Ihnen ein paar gezielte Fragen, damit wir Ihre Website genau richtig bauen – ganz in Ruhe, Schritt für Schritt. Womit fangen wir an: Was machen Sie beruflich, und was genau bieten Sie an?';
 
     // Gezielte Folgefragen (Thema 2…). Reihenfolge dient zugleich dem Fallback ohne Backend.
@@ -1867,31 +1872,26 @@ ul { list-style: none; }
             'BRIEFING_JSON:\n' + JSON.stringify(obj);
     }
 
-    // Eine Lumi-Antwort holen: erst echte API, bei Fehler Fallback
-    function lumiAsk(messages, pkg) {
+    // Eine Lumi-Antwort holen. Server erkennt das BRIEFING_JSON selbst und meldet
+    // { reply, done, leadId }. Bei Netzwerk-/Serverfehler: gescripteter Fallback.
+    // Rückgabe immer: { reply, done, leadId, blocked?, fallback? }
+    function lumiAsk(message, history, pkg, token) {
         return fetch(LUMI_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages: messages, package: pkg || null })
+            body: JSON.stringify({ sessionToken: token, message: message, history: history || [], package: pkg || null })
         }).then(function (res) {
-            if (!res.ok) { throw new Error('http ' + res.status); }
-            return res.json();
-        }).then(function (data) {
-            if (!data || typeof data.reply !== 'string') { throw new Error('format'); }
-            return data.reply;
+            return res.json().catch(function () { return {}; }).then(function (data) {
+                if (res.status === 429) { return { reply: (data && data.error) || 'Tageslimit erreicht. Bitte später erneut versuchen oder über das Kontaktformular melden.', done: false, blocked: true }; }
+                if (!res.ok || !data || typeof data.reply !== 'string') { throw new Error('bad-response'); }
+                return { reply: data.reply, done: !!data.done, leadId: data.leadId || null };
+            });
         }).catch(function () {
-            return lumiScripted(messages);
+            // Fallback ohne erreichbares Backend: gescriptetes Gespräch
+            var hist = (history || []).concat([{ role: 'user', content: message }]);
+            var parsed = lumiParseReply(lumiScripted(hist));
+            return { reply: parsed.spoken, done: !!parsed.briefing, leadId: null, fallback: true };
         });
-    }
-
-    // Briefing absenden (Teil B-Backend speichert/mailt). Fehler werden geschluckt (Demo).
-    function lumiSubmit(payload) {
-        try {
-            return fetch(LUMI_SUBMIT_ENDPOINT, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            }).then(function (r) { return r.ok; }).catch(function () { return false; });
-        } catch (e) { return Promise.resolve(false); }
     }
 
     /* =========================================================
@@ -1956,6 +1956,11 @@ ul { list-style: none; }
         '.lumi-disclaimer{font-size:.67rem;color:#9aa0a6;text-align:center;padding:7px 14px 10px;background:#fff;line-height:1.45;}' +
         '.lumi-cta{width:100%;border:none;border-radius:12px;background:#E6D8C3;color:#0B2545;font-weight:700;padding:13px;cursor:pointer;font-family:inherit;font-size:.95rem;transition:background .2s;}' +
         '.lumi-cta:hover{background:#f1e7d6;}.lumi-cta:disabled{opacity:.5;cursor:not-allowed;}' +
+        '.lumi-pkgs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px;}' +
+        '.lumi-pkg{display:flex;flex-direction:column;align-items:flex-start;gap:2px;border:1.5px solid #e2e0d8;border-radius:12px;background:#fff;padding:12px 14px;cursor:pointer;font-family:inherit;text-align:left;transition:border-color .15s,transform .15s;}' +
+        '.lumi-pkg:hover{border-color:#0B2545;transform:translateY(-2px);}' +
+        '.lumi-pkg strong{font-size:.95rem;color:#1C1E21;}.lumi-pkg span{font-size:.8rem;color:#5a5f66;}' +
+        '.lumi-pkg.ghost{grid-column:1 / -1;align-items:center;background:#F2F1EC;}' +
         '.lumi-sum .s-card{background:#fff;border:1px solid #e2e0d8;border-radius:12px;padding:6px 14px;margin-bottom:12px;}' +
         '.lumi-sum .s-row{padding:9px 0;border-bottom:1px solid #f0eee7;}.lumi-sum .s-row:last-child{border-bottom:none;}' +
         '.lumi-sum .s-q{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;color:#9aa0a6;font-weight:700;margin-bottom:2px;}' +
@@ -2004,7 +2009,7 @@ ul { list-style: none; }
         var stepLabel = win.querySelector('#lumiStep');
         var dotsWrap = win.querySelector('#lumiDots');
 
-        var state = { started: false, done: false, busy: false, files: [], messages: [], qa: [], briefing: null, lastQ: '' };
+        var state = { started: false, done: false, busy: false, files: [], messages: [], qa: [], briefing: null, lastQ: '', pkg: null, token: null, leadId: null };
 
         /* ---- Öffnen / Schließen ---- */
         function openWin() {
@@ -2021,18 +2026,43 @@ ul { list-style: none; }
             progress.hidden = true; entry.hidden = true;
             body.innerHTML =
                 '<div class="lumi-gate"><h4>Kurz vorab</h4>' +
-                '<p>Lumi nutzt einen KI-Dienst (Anthropic, USA) zur Verarbeitung Ihrer Eingaben. Bitte geben Sie hier <strong>keine sensiblen Daten</strong> ein. Mehr dazu in der <a href="datenschutz.html" target="_blank" rel="noopener">Datenschutzerklärung</a>.</p>' +
-                '<label><input type="checkbox" id="lumiAgree"> Ich bin einverstanden, dass meine Eingaben zur Erstellung des Briefings verarbeitet werden.</label>' +
-                '<button class="lumi-cta" id="lumiStart" type="button" disabled>Gespräch starten</button></div>';
+                '<p>Lumi nutzt den KI-Dienst <strong>Google Gemini</strong> zur Verarbeitung Ihrer Eingaben. Die Verarbeitung kann <strong>außerhalb der EU</strong> erfolgen. Bitte geben Sie hier <strong>keine sensiblen Daten</strong> ein. Mehr dazu in der <a href="datenschutz.html" target="_blank" rel="noopener">Datenschutzerklärung</a>.</p>' +
+                '<label><input type="checkbox" id="lumiAgree"> Ich bin einverstanden, dass meine Eingaben über Google Gemini zur Erstellung des Briefings verarbeitet werden.</label>' +
+                '<button class="lumi-cta" id="lumiStart" type="button" disabled>Weiter</button></div>';
             var agree = body.querySelector('#lumiAgree');
             var start = body.querySelector('#lumiStart');
             agree.addEventListener('change', function () { start.disabled = !agree.checked; });
-            start.addEventListener('click', startChat);
+            start.addEventListener('click', renderPackagePick);
         }
 
-        /* ---- Chat starten ---- */
-        function startChat() {
+        /* ---- Paketwahl vor dem Chat (Kostenschutz: Lumi erst nach Paketwahl) ---- */
+        function renderPackagePick() {
+            progress.hidden = true; entry.hidden = true;
+            var pakete = [
+                { id: 'basis', name: 'Basis', preis: '990 €' },
+                { id: 'pro', name: 'Pro', preis: '2.990 €' },
+                { id: 'platin', name: 'Platin', preis: '5.990 €' },
+                { id: 'enterprise', name: 'Enterprise', preis: 'ab 9.990 €' }
+            ];
+            var cards = pakete.map(function (p) {
+                return '<button type="button" class="lumi-pkg" data-pkg="' + p.id + '"><strong>' + p.name + '</strong><span>' + p.preis + '</span></button>';
+            }).join('');
+            body.innerHTML =
+                '<div class="lumi-gate"><h4>Welches Paket interessiert Sie?</h4>' +
+                '<p>So kann Lumi Ihr Briefing passend aufnehmen. Noch unsicher? Wählen Sie einfach „Noch unsicher“ – Sie legen sich damit nicht fest.</p>' +
+                '<div class="lumi-pkgs">' + cards +
+                '<button type="button" class="lumi-pkg ghost" data-pkg=""><strong>Noch unsicher</strong><span>einfach starten</span></button>' +
+                '</div></div>';
+            body.querySelectorAll('.lumi-pkg').forEach(function (b) {
+                b.addEventListener('click', function () { startChat(b.getAttribute('data-pkg') || null); });
+            });
+        }
+
+        /* ---- Chat starten (nach Consent + Paketwahl) ---- */
+        function startChat(pkg) {
             state.started = true;
+            state.pkg = pkg || null;
+            state.token = lumiNewToken();
             body.innerHTML = '';
             entry.hidden = false; progress.hidden = false;
             buildDots();
@@ -2090,34 +2120,23 @@ ul { list-style: none; }
             if (!v) { return; }
             addMsg(v, 'me');
             state.qa.push({ q: state.lastQ, a: v });
+            var hist = state.messages.slice();        // bisherige Turns (ohne aktuelle Nachricht)
             state.messages.push({ role: 'user', content: v });
             input.value = ''; input.style.height = 'auto';
             updateProgress();
 
-            // Missbrauchsschutz (B1)
-            if (state.messages.filter(function (m) { return m.role === 'user'; }).length > LUMI_MAX_TURNS) {
-                state.done = true; updateProgress();
-                botSay('Ich habe genug für ein gutes Briefing — ich fasse jetzt zusammen.', function () { setTimeout(renderSummary, 400); });
-                return;
-            }
-
             state.busy = true;
             var t = showTyping();
-            lumiAsk(state.messages, null).then(function (reply) {
-                t.remove();
-                var parsed = lumiParseReply(reply);
-                addMsg(parsed.spoken, 'bot');
-                state.messages.push({ role: 'assistant', content: parsed.spoken });
-                state.lastQ = parsed.spoken;
-                state.busy = false;
-                if (parsed.briefing) {
-                    state.briefing = parsed.briefing;
-                    state.done = true;
-                    updateProgress();
-                    setTimeout(renderSummary, 500);
-                } else {
-                    updateProgress();
-                }
+            // Server (lumi-chat) erkennt das Briefing selbst und meldet done/leadId.
+            lumiAsk(v, hist, state.pkg, state.token).then(function (resp) {
+                t.remove(); state.busy = false;
+                addMsg(resp.reply, 'bot');
+                state.messages.push({ role: 'assistant', content: resp.reply });
+                state.lastQ = resp.reply;
+                if (resp.leadId) { state.leadId = resp.leadId; }
+                if (resp.blocked) { return; }   // Tageslimit erreicht – höflich gestoppt
+                if (resp.done) { state.done = true; updateProgress(); setTimeout(renderSummary, 500); }
+                else { updateProgress(); }
             });
         }
         sendBtn.addEventListener('click', send);
@@ -2168,15 +2187,12 @@ ul { list-style: none; }
         }
 
         function submitBriefing() {
-            // editierte Werte zurückschreiben
             body.querySelectorAll('#lumiSumCard .s-a').forEach(function (t) {
                 var i = +t.getAttribute('data-qa'); if (state.qa[i]) { state.qa[i].a = t.value.trim(); }
             });
-            lumiSubmit({
-                type: 'briefing', source: 'widget', package: null,
-                conversation: state.qa, briefing: state.briefing,
-                files: state.files.map(function (f) { return { name: f.name, size: f.size }; })
-            });
+            // Hinweis: Das Briefing wurde bereits serverseitig gespeichert
+            // (lumi-chat → done, Lead + Briefing in Supabase). Der echte Datei-Upload
+            // zum Lead (state.leadId) folgt in Teil 5 über /api/upload-url.
             body.innerHTML =
                 '<div class="lumi-done"><div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg></div>' +
                 '<h4>Ihr Briefing ist eingegangen</h4>' +
@@ -2199,15 +2215,18 @@ ul { list-style: none; }
 
     // Zustand der Buchung
     var state = {
-        pkg: null, price: null,
+        pkg: null, price: null, pkgId: null,
         method: null,       // 'lumi' | 'text'
         chatMessages: [],   // API-Verlauf (role/content)
         qa: [],             // {q,a}-Paare für die Zusammenfassung
-        briefing: null,     // geparstes BRIEFING_JSON (falls vorhanden)
+        briefing: null,
         lastQ: '',
         chatStarted: false,
+        chatConsented: false,
         chatDone: false,
         busy: false,
+        token: null,
+        leadId: null,
         projectText: '',
         files: [],
         contact: { name: '', email: '', phone: '' }
@@ -2266,6 +2285,8 @@ ul { list-style: none; }
 
     function openModal(pkg, price) {
         state.pkg = pkg; state.price = price;
+        var m = (pkg || '').toLowerCase();
+        state.pkgId = m.indexOf('basis') >= 0 ? 'basis' : m.indexOf('pro') >= 0 ? 'pro' : m.indexOf('platin') >= 0 ? 'platin' : m.indexOf('enterprise') >= 0 ? 'enterprise' : null;
         modalPkg.innerHTML = 'Dein gewähltes Paket<strong>' + pkg + ' · ' + price + '</strong>';
         goTo('method');
         modal.classList.add('open');
@@ -2329,12 +2350,28 @@ ul { list-style: none; }
     function startChat() {
         if (state.chatStarted) { return; }
         state.chatStarted = true;
+        state.token = lumiNewToken();
         updateProgress();
+        if (state.chatConsented) { beginChat(); return; }
+        // DSGVO: aktive Bestätigung vor dem ersten KI-Aufruf
+        if (chatInput) { chatInput.disabled = true; }
+        var c = document.createElement('div');
+        c.className = 'bubble bot';
+        c.innerHTML = '<span class="lumi-ava">' + LUMI_SVG + '</span><span>Bevor wir starten: Lumi nutzt den KI-Dienst <strong>Google Gemini</strong>; Ihre Eingaben können außerhalb der EU verarbeitet werden. Bitte geben Sie keine sensiblen Daten ein. Mehr in der <a href="datenschutz.html" target="_blank" rel="noopener">Datenschutzerklärung</a>.<br><button type="button" class="btn btn-primary" id="chatConsentBtn" style="margin-top:10px;">Einverstanden – Gespräch starten</button></span>';
+        chatLog.appendChild(c); chatLog.scrollTop = chatLog.scrollHeight;
+        c.querySelector('#chatConsentBtn').addEventListener('click', function () {
+            state.chatConsented = true; c.remove();
+            if (chatInput) { chatInput.disabled = false; }
+            beginChat();
+        });
+    }
+    function beginChat() {
         var typing = showTyping();
         setTimeout(function () {
             typing.remove();
             addBubble(LUMI_GREETING, 'bot');
             state.lastQ = LUMI_GREETING;
+            if (chatInput) { chatInput.focus(); }
         }, 500);
     }
     function sendChat() {
@@ -2343,30 +2380,21 @@ ul { list-style: none; }
         if (!val) { return; }
         addBubble(val, 'me');
         state.qa.push({ q: state.lastQ, a: val });
+        var hist = state.chatMessages.slice();
         state.chatMessages.push({ role: 'user', content: val });
         chatInput.value = '';
         updateProgress();
-        // Missbrauchs-/Kostenschutz (B1)
-        if (state.chatMessages.filter(function (m) { return m.role === 'user'; }).length > LUMI_MAX_TURNS) {
-            state.chatDone = true; updateProgress(); btnNext.hidden = false;
-            var tt = showTyping();
-            setTimeout(function () { tt.remove(); addBubble('Ich habe genug für ein gutes Briefing — im nächsten Schritt sehen Sie die Zusammenfassung.', 'bot'); }, 500);
-            return;
-        }
         state.busy = true;
         var typing = showTyping();
-        lumiAsk(state.chatMessages, state.pkg).then(function (reply) {
-            typing.remove();
-            var parsed = lumiParseReply(reply);
-            addBubble(parsed.spoken, 'bot');
-            state.chatMessages.push({ role: 'assistant', content: parsed.spoken });
-            state.lastQ = parsed.spoken;
-            state.busy = false;
-            if (parsed.briefing) {
-                state.briefing = parsed.briefing;
-                state.chatDone = true;
-                btnNext.hidden = false;
-            }
+        // Server (lumi-chat) übernimmt Rate-Limit + Briefing-Erkennung; gibt done/leadId zurück.
+        lumiAsk(val, hist, state.pkgId, state.token).then(function (resp) {
+            typing.remove(); state.busy = false;
+            addBubble(resp.reply, 'bot');
+            state.chatMessages.push({ role: 'assistant', content: resp.reply });
+            state.lastQ = resp.reply;
+            if (resp.leadId) { state.leadId = resp.leadId; }
+            if (resp.blocked) { updateProgress(); return; }
+            if (resp.done) { state.chatDone = true; btnNext.hidden = false; }
             updateProgress();
         });
     }
@@ -2487,14 +2515,10 @@ ul { list-style: none; }
         }
         if (key === 'summary') {
             saveSummaryEdits();
-            lumiSubmit({
-                type: 'buchung', source: 'modal',
-                package: state.pkg, price: state.price, method: state.method,
-                conversation: state.method === 'lumi' ? state.qa : null,
-                projektbeschreibung: state.method === 'text' ? state.projectText : null,
-                briefing: state.briefing, contact: state.contact,
-                files: state.files.map(function (f) { return { name: f.name, size: f.size }; })
-            });
+            // Lumi-Pfad: Lead + Briefing wurden bereits serverseitig gespeichert
+            // (lumi-chat → done, state.leadId). Datei-Upload folgt in Teil 5.
+            // Text-Pfad (ohne KI): Speicherung über eine eigene Function (/api/lead)
+            // wird in Teil 4/5 ergänzt.
             goTo('done');
             return;
         }
