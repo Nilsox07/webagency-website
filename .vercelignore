@@ -1,0 +1,8 @@
+# Was NICHT auf das (statische) Vercel-CDN ausgeliefert wird.
+# Ausgeliefert werden die generierten *.html im Wurzelverzeichnis + /assets/.
+# Die PHP-Bau-Quelle (app/) wird nur lokal/beim Build gebraucht.
+
+app/
+REFACTORING_PLAN.md
+REFACTORING_SUMMARY.md
+MIGRATION_NOTES.md
